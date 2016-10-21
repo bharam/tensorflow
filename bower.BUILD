@@ -3,15 +3,6 @@
 package(default_visibility = ["//visibility:public"])
 
 filegroup(
-    name = "d3",
-    srcs = [
-        "d3.js",
-        "d3.min.js",
-        "package.js",
-    ],
-)
-
-filegroup(
     name = "dagre",
     srcs = [
         "dist/dagre.core.js",
