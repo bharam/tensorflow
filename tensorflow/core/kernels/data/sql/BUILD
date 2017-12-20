@@ -34,6 +34,6 @@ cc_library(
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core/lib/db:sqlite",
-        "@sqlite_archive//:sqlite",
+        "@org_sqlite",
     ],
 )

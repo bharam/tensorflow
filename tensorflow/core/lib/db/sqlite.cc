@@ -14,190 +14,91 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/core/lib/db/sqlite.h"
 
-#include "tensorflow/core/lib/io/record_reader.h"
-#include "tensorflow/core/platform/logging.h"
+extern "C" int sqlite3_snapfn_init(sqlite3*, const char**, const void*);
 
 namespace tensorflow {
-namespace {
-
-void ExecuteOrLog(Sqlite* db, const char* sql) {
-  Status s = db->Prepare(sql).StepAndReset();
-  if (!s.ok()) {
-    LOG(WARNING) << s.ToString();
-  }
-}
-
-string ExecuteOrEmpty(Sqlite* db, const char* sql) {
-  auto stmt = db->Prepare(sql);
-  bool is_done = false;
-  if (stmt.Step(&is_done).ok() && !is_done) {
-    return stmt.ColumnString(0);
-  }
-  return "";
-}
-
-}  // namespace
 
 /* static */
-xla::StatusOr<std::shared_ptr<Sqlite>> Sqlite::Open(const string& uri) {
-  sqlite3* sqlite = nullptr;
-  TF_RETURN_IF_ERROR(MakeStatus(sqlite3_open(uri.c_str(), &sqlite)));
-  Sqlite* db = new Sqlite(sqlite, uri);
-  // This is the SQLite default since 2016. However it's good to set
-  // this anyway, since we might get linked against an older version of
-  // the library, and it's pretty much impossible to change later.
-  ExecuteOrLog(db, "PRAGMA page_size=4096");
-  return std::shared_ptr<Sqlite>(db);
-}
-
-/* static */ Status Sqlite::MakeStatus(int resultCode) {
+template <typename... Args>
+Status Sqlite::MakeStatus(int code, Args&&... args) {
   // See: https://sqlite.org/rescode.html
-  switch (resultCode & 0xff) {
+  switch (code & 0xff) {
     case SQLITE_OK:
-    case SQLITE_ROW:   // sqlite3_step() has another row ready
-    case SQLITE_DONE:  // sqlite3_step() has finished executing
+    case SQLITE_ROW:
+    case SQLITE_DONE:
       return Status::OK();
     case SQLITE_ABORT:  // Callback routine requested an abort
-      return errors::Aborted(sqlite3_errstr(resultCode));
+      return errors::Aborted(std::forward<Args>(args)...);
     case SQLITE_READONLY:  // Attempt to write a readonly database
     case SQLITE_MISMATCH:  // Data type mismatch
-      return errors::FailedPrecondition(sqlite3_errstr(resultCode));
+      return errors::FailedPrecondition(std::forward<Args>(args)...);
     case SQLITE_MISUSE:    // Library used incorrectly
     case SQLITE_INTERNAL:  // Internal logic error in SQLite
-      return errors::Internal(sqlite3_errstr(resultCode));
+      return errors::Internal(std::forward<Args>(args)...);
     case SQLITE_RANGE:  // 2nd parameter to sqlite3_bind out of range
-      return errors::OutOfRange(sqlite3_errstr(resultCode));
+      return errors::OutOfRange(std::forward<Args>(args)...);
     case SQLITE_CANTOPEN:    // Unable to open the database file
     case SQLITE_CONSTRAINT:  // Abort due to constraint violation
     case SQLITE_NOTFOUND:    // Unknown opcode or statement parameter name
     case SQLITE_NOTADB:      // File opened that is not a database file
-      return errors::InvalidArgument(sqlite3_errstr(resultCode));
+      return errors::InvalidArgument(std::forward<Args>(args)...);
     case SQLITE_CORRUPT:  // The database disk image is malformed
-      return errors::DataLoss(sqlite3_errstr(resultCode));
+      return errors::DataLoss(std::forward<Args>(args)...);
     case SQLITE_AUTH:  // Authorization denied
     case SQLITE_PERM:  // Access permission denied
-      return errors::PermissionDenied(sqlite3_errstr(resultCode));
+      return errors::PermissionDenied(std::forward<Args>(args)...);
     case SQLITE_FULL:    // Insertion failed because database is full
     case SQLITE_TOOBIG:  // String or BLOB exceeds size limit
     case SQLITE_NOLFS:   // Uses OS features not supported on host
-      return errors::ResourceExhausted(sqlite3_errstr(resultCode));
+      return errors::ResourceExhausted(std::forward<Args>(args)...);
     case SQLITE_BUSY:      // The database file is locked
     case SQLITE_LOCKED:    // A table in the database is locked
     case SQLITE_PROTOCOL:  // Database lock protocol error
     case SQLITE_NOMEM:     // A malloc() failed
-      return errors::Unavailable(sqlite3_errstr(resultCode));
+      return errors::Unavailable(std::forward<Args>(args)...);
     case SQLITE_INTERRUPT:  // Operation terminated by sqlite3_interrupt
-      return errors::Cancelled(sqlite3_errstr(resultCode));
+      return errors::Cancelled(std::forward<Args>(args)...);
     case SQLITE_ERROR:   // SQL error or missing database
     case SQLITE_IOERR:   // Some kind of disk I/O error occurred
     case SQLITE_SCHEMA:  // The database schema changed
     default:
-      return errors::Unknown(sqlite3_errstr(resultCode));
+      return errors::Unknown(std::forward<Args>(args)...);
   }
 }
 
-Sqlite::Sqlite(sqlite3* db, const string& uri) : db_(db), uri_(uri) {}
-
-Sqlite::~Sqlite() {
-  // close_v2 doesn't care if a stmt hasn't been GC'd yet
-  int rc = sqlite3_close_v2(db_);
+/* static */
+xla::StatusOr<std::shared_ptr<Sqlite>> Sqlite::Open(string path, int flags) {
+  sqlite3* sqlite = nullptr;
+  int rc = sqlite3_open_v2(path.c_str(), &sqlite, flags, nullptr);
   if (rc != SQLITE_OK) {
-    LOG(ERROR) << "destruct sqlite3: " << MakeStatus(rc);
+    return MakeStatus(rc, sqlite3_errstr(rc), ": ", path);
   }
+  CHECK_EQ(SQLITE_OK, sqlite3_snapfn_init(sqlite, nullptr, nullptr));
+  auto result = std::shared_ptr<Sqlite>(new Sqlite(sqlite, std::move(path)));
+  result->self_ = std::weak_ptr<Sqlite>(result);
+  return result;
 }
 
-Status Sqlite::Close() {
-  if (db_ == nullptr) {
-    return Status::OK();
-  }
-  // If Close is explicitly called, ordering must be correct.
-  Status s = MakeStatus(sqlite3_close(db_));
-  if (s.ok()) {
-    db_ = nullptr;
-  }
-  return s;
-}
-
-void Sqlite::UseWriteAheadLogWithReducedDurabilityIfPossible() {
-  // TensorFlow summaries are intensively write-heavy, cf. most apps.
-  // This pragma loves writes and means that TensorBoard can read the
-  // database even as the training job inserts stuff. In other words,
-  // this makes SQLite almost as powerful as MySQL or PostgreSQL.
-  // https://www.sqlite.org/wal.html
-  string journal = ExecuteOrEmpty(this, "PRAGMA journal_mode=wal");
-  if (journal != "wal") {
-    LOG(WARNING) << "Failed to set journal_mode=wal because SQLite wants "
-                 << uri_ << " to be in '" << journal << "' mode, which might "
-                 << "be bad since WAL is important for the performance of "
-                 << "write-intensive apps. This might only happen for memory "
-                 << "databases or old versions of SQLite, but is definitely "
-                 << "worth fixing if that's not the case";
-  } else {
-    // This setting means we might lose transactions due to power loss,
-    // but the database can't become corrupted. In exchange, we get the
-    // the performance of a NoSQL database. This is a trade-off most data
-    // scientists would consider acceptable.
-    // https://www.sqlite.org/pragma.html#pragma_synchronous
-    ExecuteOrLog(this, "PRAGMA synchronous=NORMAL");
-  }
-}
-
-SqliteStatement Sqlite::Prepare(const string& sql) {
+xla::StatusOr<SqliteStatement> Sqlite::Prepare(const string& sql) {
   sqlite3_stmt* stmt = nullptr;
   int rc = sqlite3_prepare_v2(db_, sql.c_str(), sql.size() + 1, &stmt, nullptr);
-  if (rc == SQLITE_OK) {
-    return {stmt, SQLITE_OK, std::unique_ptr<string>(nullptr)};
-  } else {
-    return {nullptr, rc, std::unique_ptr<string>(new string(sql))};
+  if (TF_PREDICT_TRUE(rc == SQLITE_OK)) {
+    SqliteStatement result{stmt, self_.lock()};
+    return result;
   }
-}
-
-Status SqliteStatement::status() const {
-  Status s = Sqlite::MakeStatus(error_);
-  if (!s.ok()) {
-    if (stmt_ != nullptr) {
-      errors::AppendToMessage(&s, sqlite3_sql(stmt_));
-    } else {
-      errors::AppendToMessage(&s, *prepare_error_sql_);
-    }
-  }
-  return s;
-}
-
-void SqliteStatement::CloseOrLog() {
-  if (stmt_ != nullptr) {
-    int rc = sqlite3_finalize(stmt_);
-    if (rc != SQLITE_OK) {
-      LOG(ERROR) << "destruct sqlite3_stmt: " << Sqlite::MakeStatus(rc);
-    }
-    stmt_ = nullptr;
-  }
-}
-
-Status SqliteStatement::Close() {
-  if (stmt_ == nullptr) {
-    return Status::OK();
-  }
-  int rc = sqlite3_finalize(stmt_);
-  if (rc == SQLITE_OK) {
-    stmt_ = nullptr;
-  }
-  Update(rc);
-  return status();
-}
-
-void SqliteStatement::Reset() {
-  if (TF_PREDICT_TRUE(stmt_ != nullptr)) {
-    sqlite3_reset(stmt_);
-    sqlite3_clear_bindings(stmt_);  // not nullptr friendly
-  }
-  error_ = SQLITE_OK;
+  return MakeStatus(rc, "Prepare failed: ", sqlite3_errmsg(db_), " for ", sql);
 }
 
 Status SqliteStatement::Step(bool* isDone) {
-  if (TF_PREDICT_FALSE(error_ != SQLITE_OK)) {
+  if (TF_PREDICT_FALSE(stmt_ == nullptr)) {
     *isDone = true;
-    return status();
+    return errors::FailedPrecondition("sqlite3_stmt absent");
+  }
+  if (TF_PREDICT_FALSE(bind_error_ != SQLITE_OK)) {
+    *isDone = true;
+    return Sqlite::MakeStatus(bind_error_, db_->errmsg(), " on parameter ",
+                              bind_error_parameter_, " for ",
+                              sqlite3_sql(stmt_));
   }
   int rc = sqlite3_step(stmt_);
   switch (rc) {
@@ -209,26 +110,9 @@ Status SqliteStatement::Step(bool* isDone) {
       return Status::OK();
     default:
       *isDone = true;
-      error_ = rc;
-      return status();
+      return Sqlite::MakeStatus(rc, "Step failed: ", db_->errmsg(), " for ",
+                                sqlite3_sql(stmt_));
   }
-}
-
-Status SqliteStatement::StepAndReset() {
-  if (TF_PREDICT_FALSE(error_ != SQLITE_OK)) {
-    return status();
-  }
-  Status s;
-  int rc = sqlite3_step(stmt_);
-  if (rc != SQLITE_DONE) {
-    if (rc == SQLITE_ROW) {
-      s.Update(errors::Internal("unexpected sqlite row"));
-    } else {
-      s.Update(Sqlite::MakeStatus(rc));
-    }
-  }
-  Reset();
-  return s;
 }
 
 }  // namespace tensorflow

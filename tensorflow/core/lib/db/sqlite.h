@@ -23,149 +23,105 @@ limitations under the License.
 #include "tensorflow/compiler/xla/statusor.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/lib/core/stringpiece.h"
+#include "tensorflow/core/lib/strings/strcat.h"
+#include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/macros.h"
 #include "tensorflow/core/platform/types.h"
 
 namespace tensorflow {
 
-class SqliteStatement;
+class Sqlite;
 
-/// \brief SQLite connection object.
+/// \brief SQLite prepared statement.
 ///
-/// This class is a thin wrapper around `sqlite3` that makes it easier
-/// and safer to use SQLite in the TensorFlow C++ codebase. It removes
-/// deprecated APIs, improves the safety of others, adds helpers, and
-/// pretends UTF16 doesn't exist.
-///
-/// Instances are thread safe, with the exception of Close().
-class Sqlite {
- public:
-  /// \brief Opens SQLite database file.
-  ///
-  /// The `uri` parameter can be a filename, or a proper URI like
-  /// `file:/tmp/tf.sqlite?mode=ro&cache=private`. It can also be
-  /// `file::memory:` for testing.
-  ///
-  /// See https://sqlite.org/c3ref/open.html
-  static xla::StatusOr<std::shared_ptr<Sqlite>> Open(const string& uri);
-
-  /// \brief Makes tensorflow::Status for SQLite result code.
-  ///
-  /// See https://sqlite.org/rescode.html
-  static Status MakeStatus(int resultCode);
-
-  /// \brief Destroys object and frees resources.
-  ///
-  /// This will free the underlying object if Close was not called. If
-  /// an error code is returned then it will be logged.
-  ///
-  /// Note: Unlike Close() this destructor maps to sqlite3_close_v2(),
-  /// which is lax about ordering and GC friendly.
-  ~Sqlite();
-
-  /// \brief Frees underlying SQLite object.
-  ///
-  /// Unlike the destructor, all SqliteStatement objects must be closed
-  /// beforehand. This is a no-op if already closed
-  Status Close();
-
-  /// \brief Enables WAL mode with less fsync or log a warning.
-  ///
-  /// The synchronous pragma is only set to NORMAL if WAL mode was
-  /// successfully enabled. This must be called immediately after
-  /// creating the object.
-  void UseWriteAheadLogWithReducedDurabilityIfPossible();
-
-  /// \brief Creates SQLite statement.
-  ///
-  /// Call result.status() to determine whether or not this operation
-  /// failed. It is also possible to punt the error checking to after
-  /// the values have been binded and Step() or ExecuteWriteQuery() is
-  /// called.
-  SqliteStatement Prepare(const string& sql);
-
- private:
-  explicit Sqlite(sqlite3* db, const string& uri);
-  sqlite3* db_;
-  string uri_;
-  TF_DISALLOW_COPY_AND_ASSIGN(Sqlite);
-};
-
-/// \brief SQLite prepared statement cursor object.
-///
-/// This class tracks error state internally, like Status::Update.
-///
-/// Instances of this class are not thread safe.
+/// Instances of this class, along with its associated Sqlite
+/// connection object, can be shared between multiple threads, but the
+/// caller is respnosible for using a mutex to serialize access so only
+/// a single thread accesses them all at a given moment.
 class SqliteStatement {
  public:
-  /// \brief Constructs empty statement that should be assigned later.
-  SqliteStatement() : stmt_(nullptr), error_(SQLITE_OK) {}
-
-  /// \brief Empties object and finalizes statement if needed.
-  ~SqliteStatement() { CloseOrLog(); }
+  SqliteStatement() noexcept = default;
+  ~SqliteStatement() { sqlite3_finalize(stmt_); }
 
   /// \brief Move constructor, after which <other> should not be used.
-  SqliteStatement(SqliteStatement&& other);
+  SqliteStatement(SqliteStatement&& other) noexcept
+      : stmt_(other.stmt_),
+        bind_error_(other.bind_error_),
+        db_(std::move(other.db_)) {
+    other.stmt_ = nullptr;
+    other.bind_error_ = SQLITE_OK;
+  }
 
   /// \brief Move assignment, after which <other> should not be used.
-  SqliteStatement& operator=(SqliteStatement&& other);
+  SqliteStatement& operator=(SqliteStatement&& other) noexcept {
+    if (&other != this) {
+      sqlite3_finalize(stmt_);
+      stmt_ = other.stmt_;
+      bind_error_ = other.bind_error_;
+      db_ = std::move(other.db_);
+      other.stmt_ = nullptr;
+      other.bind_error_ = SQLITE_OK;
+    }
+    return *this;
+  }
 
   /// \brief Returns true if statement is not empty.
   explicit operator bool() const { return stmt_ != nullptr; }
 
-  /// \brief Returns SQLite result code state.
-  ///
-  /// This will be SQLITE_OK unless an error happened. If multiple
-  /// errors happened, only the first error code will be returned.
-  int error() const { return error_; }
-
-  /// \brief Returns error() as a tensorflow::Status.
-  Status status() const;
-
-  /// \brief Finalize statement object.
-  ///
-  /// Please note that the destructor can also do this. This method is
-  /// a no-op if already closed.
-  Status Close();
-
-  /// \brief Executes query and/or fetches next row.
+  /// \brief Executes query for fetching arbitrary rows.
   ///
   /// `isDone` will always be set to true unless SQLITE_ROW is returned
   /// by the underlying API. If status() is already in an error state,
   /// then this method is a no-op and the existing status is returned.
-  Status Step(bool* isDone);
+  Status Step(bool* is_done);
 
-  /// \brief Executes query that returns no data.
-  ///
-  /// This helper calls Step(), ensures SQLITE_DONE was returned, then
-  /// resets the statement and clears the bindings. If status() is
-  /// already in an error state, then this method is a no-op and the
-  /// existing status is returned.
-  Status StepAndReset();
+  /// \brief Executes query when one row is desired.
+  Status Step() {
+    bool is_done;
+    TF_RETURN_IF_ERROR(Step(&is_done));
+    if (TF_PREDICT_FALSE(is_done)) {
+      return errors::Internal("wanted sqlite row: ", sqlite3_sql(stmt_));
+    }
+    return Status::OK();
+  }
+
+  /// \brief Executes query when no rows must be returned and Reset().
+  Status StepAndReset() {
+    bool is_done;
+    Status s = Step(&is_done);
+    if (TF_PREDICT_TRUE(s.ok()) && TF_PREDICT_FALSE(!is_done)) {
+      s = errors::Internal("unexpected sqlite row: ", sqlite3_sql(stmt_));
+    }
+    Reset();
+    return s;
+  }
 
   /// \brief Resets statement so it can be executed again.
   ///
   /// - Resets the prepared statement
   /// - Sets all Bind*() values to NULL
-  ///
-  /// Support for calling sqlite3_reset() and sqlite3_clear_bindings()
-  /// independently may be added in the future if a compelling use case
-  /// can be demonstrated.
-  void Reset();
+  void Reset() {
+    if (TF_PREDICT_TRUE(stmt_ != nullptr)) {
+      sqlite3_reset(stmt_);
+      sqlite3_clear_bindings(stmt_);  // not nullptr friendly
+    }
+    bind_error_ = SQLITE_OK;
+  }
 
   /// \brief Binds signed 64-bit integer to 1-indexed query parameter.
   void BindInt(int parameter, int64 value) {
-    Update(sqlite3_bind_int64(stmt_, parameter, value));
+    Update(sqlite3_bind_int64(stmt_, parameter, value), parameter);
   }
-  void BindInt(const string& parameter, int64 value) {
+  void BindInt(const char* parameter, int64 value) {
     BindInt(GetParameterIndex(parameter), value);
   }
 
   /// \brief Binds double to 1-indexed query parameter.
   void BindDouble(int parameter, double value) {
-    Update(sqlite3_bind_double(stmt_, parameter, value));
+    Update(sqlite3_bind_double(stmt_, parameter, value), parameter);
   }
-  void BindDouble(const string& parameter, double value) {
+  void BindDouble(const char* parameter, double value) {
     BindDouble(GetParameterIndex(parameter), value);
   }
 
@@ -174,20 +130,22 @@ class SqliteStatement {
   /// If NUL characters are present, they will still go in the DB and
   /// be successfully retrieved by ColumnString(); however, the
   /// behavior of these values with SQLite functions is undefined.
-  void BindText(int parameter, const string& text) {
+  void BindText(int parameter, const StringPiece& text) {
     Update(sqlite3_bind_text64(stmt_, parameter, text.data(), text.size(),
-                               SQLITE_TRANSIENT, SQLITE_UTF8));
+                               SQLITE_TRANSIENT, SQLITE_UTF8),
+           parameter);
   }
-  void BindText(const string& parameter, const string& text) {
+  void BindText(const char* parameter, const StringPiece& text) {
     BindText(GetParameterIndex(parameter), text);
   }
 
   /// \brief Copies binary data to 1-indexed query parameter.
-  void BindBlob(int parameter, const string& blob) {
+  void BindBlob(int parameter, const StringPiece& blob) {
     Update(sqlite3_bind_blob64(stmt_, parameter, blob.data(), blob.size(),
-                               SQLITE_TRANSIENT));
+                               SQLITE_TRANSIENT),
+           parameter);
   }
-  void BindBlob(const string& parameter, const string& blob) {
+  void BindBlob(const char* parameter, const StringPiece& blob) {
     BindBlob(GetParameterIndex(parameter), blob);
   }
 
@@ -199,11 +157,12 @@ class SqliteStatement {
   /// If NUL characters are present, they will still go in the DB and
   /// be successfully retrieved by ColumnString(); however, the
   /// behavior of these values with SQLite functions is undefined.
-  void BindTextUnsafe(int parameter, const string& text) {
+  void BindTextUnsafe(int parameter, const StringPiece& text) {
     Update(sqlite3_bind_text64(stmt_, parameter, text.data(), text.size(),
-                               SQLITE_STATIC, SQLITE_UTF8));
+                               SQLITE_STATIC, SQLITE_UTF8),
+           parameter);
   }
-  void BindTextUnsafe(const string& parameter, const string& text) {
+  void BindTextUnsafe(const char* parameter, const StringPiece& text) {
     BindTextUnsafe(GetParameterIndex(parameter), text);
   }
 
@@ -211,12 +170,21 @@ class SqliteStatement {
   ///
   /// The contents of `blob` must not be changed or freed until Reset()
   /// or Close() is called.
-  void BindBlobUnsafe(int parameter, const string& blob) {
+  void BindBlobUnsafe(int parameter, const StringPiece& blob) {
     Update(sqlite3_bind_blob64(stmt_, parameter, blob.data(), blob.size(),
-                               SQLITE_STATIC));
+                               SQLITE_STATIC),
+           parameter);
   }
-  void BindBlobUnsafe(const string& parameter, const string& text) {
+  void BindBlobUnsafe(const char* parameter, const StringPiece& text) {
     BindBlobUnsafe(GetParameterIndex(parameter), text);
+  }
+
+  /// \brief Creates an empty placeholder for a BLOB written later.
+  void BindZeroBlob(int parameter, uint64 size) {
+    Update(sqlite3_bind_zeroblob64(stmt_, parameter, size), parameter);
+  }
+  void BindZeroBlob(const char* parameter, uint64 size) {
+    BindZeroBlob(GetParameterIndex(parameter), size);
   }
 
   /// \brief Returns number of columns in result set.
@@ -269,56 +237,163 @@ class SqliteStatement {
 
  private:
   friend Sqlite;
-  SqliteStatement(sqlite3_stmt* stmt, int error,
-                  std::unique_ptr<string> prepare_error_sql)
-      : stmt_(stmt),
-        error_(error),
-        prepare_error_sql_(std::move(prepare_error_sql)) {}
-  void CloseOrLog();
+  SqliteStatement(sqlite3_stmt* stmt, std::shared_ptr<Sqlite> db) noexcept
+      : stmt_(stmt), db_(std::move(db)) {}
 
-  void Update(int rc) {
+  void Update(int rc, int parameter) {
     if (TF_PREDICT_FALSE(rc != SQLITE_OK)) {
-      if (error_ == SQLITE_OK) {
-        error_ = rc;
+      if (bind_error_ == SQLITE_OK) {
+        bind_error_ = rc;
+        bind_error_parameter_ = parameter;
       }
     }
   }
 
-  int GetParameterIndex(const string& parameter) {
+  int GetParameterIndex(const char* parameter) {
     // Each call to this function requires O(n) strncmp().
-    int index = sqlite3_bind_parameter_index(stmt_, parameter.c_str());
+    int index = sqlite3_bind_parameter_index(stmt_, parameter);
     if (TF_PREDICT_FALSE(index == 0)) {
-      Update(SQLITE_NOTFOUND);
+      bind_error_ = SQLITE_NOTFOUND;
+      bind_error_parameter_ = 0;
     }
     return index;
   }
 
-  sqlite3_stmt* stmt_;
-  int error_;
-  std::unique_ptr<string> prepare_error_sql_;
+  sqlite3_stmt* stmt_ = nullptr;
+  int bind_error_ = SQLITE_OK;
+  int bind_error_parameter_ = 0;
+  std::shared_ptr<Sqlite> db_;
 
   TF_DISALLOW_COPY_AND_ASSIGN(SqliteStatement);
 };
 
-inline SqliteStatement::SqliteStatement(SqliteStatement&& other)
-    : stmt_(other.stmt_),
-      error_(other.error_),
-      prepare_error_sql_(std::move(other.prepare_error_sql_)) {
-  other.stmt_ = nullptr;
-  other.error_ = SQLITE_OK;
-}
+/// \brief SQLite connection object.
+///
+/// This class is a thin wrapper around `sqlite3` that makes it easier
+/// and safer to use SQLite in the TensorFlow C++ codebase. It removes
+/// deprecated APIs, improves the safety of others, adds helpers, and
+/// pretends UTF16 doesn't exist.
+///
+/// Instances of this class and its associated statements must be used
+/// by only a single thread at a time. If this pointer is shared across
+/// threads, then the caller is responsible for having a mutex to
+/// serialize access appropriately.
+///
+/// Destructors finalize statements and close the connection in the
+/// correct order, using smart pointers.
+class Sqlite {
+ public:
+  ~Sqlite() { CHECK_EQ(SQLITE_OK, sqlite3_close(db_)); }
 
-inline SqliteStatement& SqliteStatement::operator=(SqliteStatement&& other) {
-  if (&other != this) {
-    CloseOrLog();
-    stmt_ = other.stmt_;
-    error_ = other.error_;
-    prepare_error_sql_ = std::move(other.prepare_error_sql_);
-    other.stmt_ = nullptr;
-    other.error_ = SQLITE_OK;
+  /// \brief Opens SQLite database file.
+  ///
+  /// See https://sqlite.org/c3ref/open.html
+  static xla::StatusOr<std::shared_ptr<Sqlite>> Open(string path, int flags);
+
+  /// \brief Opens SQLite DB in read/write/create mode.
+  static xla::StatusOr<std::shared_ptr<Sqlite>> Open(string path) {
+    return Open(std::move(path), SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE);
   }
-  return *this;
-}
+
+  /// \brief Tries to set page size on database.
+  ///
+  /// This is really chosen once when the database is created, but we
+  /// can still try to change it; and it's totally worthwhile since
+  /// we're storing blobs. This was 1024 by default for the longest
+  /// time, until 3.12.0 (c. 2016) when it went up to 4096, which is
+  /// much more reasonable. However some folks might want to set it
+  /// even higher.
+  ///
+  /// For example, the SQLite authors did some measurements and they
+  /// determinehd that a page size of 8192 is really the optimal for
+  /// for BLOB: https://www.sqlite.org/intern-v-extern-blob.html
+  ///
+  /// The return value is what the page size actually is, after our
+  /// attempt at change.
+  int TryToSetPageSize(int bytes) {
+    auto stmt =
+        Prepare(strings::StrCat("PRAGMA page_size=", bytes)).ValueOrDie();
+    TF_CHECK_OK(stmt.StepAndReset());
+    stmt = Prepare("PRAGMA page_size").ValueOrDie();
+    TF_CHECK_OK(stmt.Step());
+    return static_cast<int>(stmt.ColumnInt(0));
+  }
+
+  /// \brief Sets busy timeout in milliseconds if possible.
+  ///
+  /// The default behavior is stuff just fails if the database is busy,
+  /// so it's strongly recommended to call this method. Doing so causes
+  /// the SQLite API to do exponential back-off retries whenever it it
+  /// encounters SQLITE_BUSY result. This can be very common if more
+  /// than one process is accessing a database file.
+  Status SetBusyTimeout(int ms) {
+    int rc = sqlite3_busy_timeout(db_, ms);
+    if (rc != SQLITE_OK) return MakeStatus(rc, sqlite3_errmsg(db_));
+    return Status::OK();
+  }
+
+  /// \brief Enables WAL mode and sets synchronous to NORMAL.
+  ///
+  /// Take for example TensorFlow summaries. If this method is called
+  /// after opening the connection, they'll get written without needing
+  /// transactions 4µs rather than 4ms! SQLite then uses shared memory
+  /// to make those writes immediately available to other processes,
+  /// e.g. TensorBoard.
+  ///
+  /// Much of that performance is gained by avoiding many calls to
+  /// fsync() and fdatasync(). This is actually a reasonable thing to
+  /// to do in WAL mode. The SQLite authors assure us that while a
+  /// power loss might result in us losing a few writes, the database
+  /// itself can't become corrupted.
+  ///
+  /// If the connection is in :memory: mode then this returns OK.
+  Status MakeSqliteGoodForWriteHeavyUseCases() {
+    auto stmt = Prepare("PRAGMA journal_mode=wal").ValueOrDie();
+    TF_RETURN_IF_ERROR(stmt.Step());
+    if (stmt.ColumnString(0) != "memory") return Status::OK();
+    if (stmt.ColumnString(0) != "wal") {
+      return errors::FailedPrecondition(
+          "The SQLite journal_mode of ", path_, " is '", stmt.ColumnString(0),
+          "' but we need it to be able to set it to 'wal' for write-intensive "
+          "purposes; perhaps provide a fresh database file");
+    }
+    return Prepare("PRAGMA synchronous=NORMAL").ValueOrDie().StepAndReset();
+  }
+
+  /// \brief Creates SQLite statement.
+  xla::StatusOr<SqliteStatement> Prepare(const string& sql);
+
+  /// \brief Returns rowid assigned to last successful insert.
+  int64 last_insert_row_id() { return sqlite3_last_insert_rowid(db_); }
+
+  /// \brief Returns pointer to current error message state.
+  const char* errmsg() { return sqlite3_errmsg(db_); }
+
+  /// \brief Returns primary result code of last error.
+  ///
+  /// If the most recent API call was successful, the result is
+  /// undefined. This should be the same as extended_errcode() & 0xff.
+  int errcode() { return sqlite3_errcode(db_); }
+
+  /// \brief Returns extended error code of last error.
+  ///
+  /// If the most recent API call was successful, the result is
+  /// undefined.
+  int extended_errcode() { return sqlite3_extended_errcode(db_); }
+
+ private:
+  friend SqliteStatement;
+  Sqlite(sqlite3* db, const string path) noexcept
+      : db_(db), path_(std::move(path)) {}
+  template <typename... Args>
+  static Status MakeStatus(int code, Args&&... args);
+
+  sqlite3* db_;
+  const string path_;
+  std::weak_ptr<Sqlite> self_;
+
+  TF_DISALLOW_COPY_AND_ASSIGN(Sqlite);
+};
 
 }  // namespace tensorflow
 

@@ -14,7 +14,7 @@ cc_library(
     deps = [
         "//tensorflow/compiler/xla:statusor",
         "//tensorflow/core:lib",
-        "@sqlite_archive//:sqlite",
+        "@org_sqlite",
     ],
 )
 
@@ -26,6 +26,29 @@ tf_cc_test(
         "//tensorflow/core:lib",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
+    ],
+)
+
+load("//tensorflow/core/lib/db:sqlite.bzl", "tf_sqlite_extension")
+
+tf_sqlite_extension(
+    name = "snapfn",
+    srcs = ["snapfn.cc"],
+    deps = [
+        "@org_sqlite",
+        "@snappy",
+    ],
+)
+
+py_test(
+    name = "snapfn_test",
+    size = "small",
+    srcs = ["snapfn_test.py"],
+    data = ["libsnapfn.so"],
+    srcs_version = "PY2AND3",
+    deps = [
+        "//tensorflow/python:client_testlib",
+        "@org_sqlite//:python",
     ],
 )
 
